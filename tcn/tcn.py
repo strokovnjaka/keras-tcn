@@ -5,6 +5,8 @@ from tensorflow.keras import backend as K, Model, Input, optimizers
 from tensorflow.keras import layers
 from tensorflow.keras.layers import Activation, SpatialDropout1D, Lambda
 from tensorflow.keras.layers import Layer, Conv1D, Dense, BatchNormalization, LayerNormalization
+from tensorflow.keras.layers import Conv2D, ZeroPadding2D, Reshape
+from keras.utils.layer_utils import count_params
 
 
 def is_power_of_two(num: int):
@@ -63,6 +65,7 @@ class ResidualBlock(Layer):
         self.layers = []
         self.layers_outputs = []
         self.shape_match_conv = None
+        self.shape_match_reshape = None
         self.res_output_shape = None
         self.final_activation = None
 
@@ -85,22 +88,50 @@ class ResidualBlock(Layer):
             self.res_output_shape = input_shape
 
             for k in range(2):
-                name = 'conv1D_{}'.format(k)
-                with K.name_scope(name):  # name scope used to make sure weights get unique names
-                    conv = Conv1D(
-                        filters=self.nb_filters,
-                        kernel_size=self.kernel_size,
-                        dilation_rate=self.dilation_rate,
-                        padding=self.padding,
-                        name=name,
-                        kernel_initializer=self.kernel_initializer
-                    )
-                    if self.use_weight_norm:
-                        from tensorflow_addons.layers import WeightNormalization
-                        # wrap it. WeightNormalization API is different than BatchNormalization or LayerNormalization.
-                        with K.name_scope('norm_{}'.format(k)):
-                            conv = WeightNormalization(conv)
-                    self._build_layer(conv)
+                if k == 0 and len(input_shape) == 4:
+                    # make a Conv2D layer by ZeroPadding2D -> Conv2D -> Reshape
+                    with K.name_scope('zeropadding2D_{}'.format(k)):
+                        zeropad = ZeroPadding2D(
+                            padding=((self.kernel_size-1, 0), (0, 0)))
+                        self._build_layer(zeropad)
+                    name = 'conv2D_{}'.format(k)
+                    # name scope used to make sure weights get unique names
+                    with K.name_scope(name):
+                        conv = Conv2D(
+                            filters=self.nb_filters,
+                            kernel_size=self.kernel_size,
+                            dilation_rate=self.dilation_rate,
+                            padding='valid',
+                            name=name,
+                            kernel_initializer=self.kernel_initializer
+                        )
+                        if self.use_weight_norm:
+                            from tensorflow_addons.layers import WeightNormalization
+                            # wrap it. WeightNormalization API is different than BatchNormalization or LayerNormalization.
+                            with K.name_scope('norm_{}'.format(k)):
+                                conv = WeightNormalization(conv)
+                        self._build_layer(conv)
+                    with K.name_scope('reshape_{}'.format(k)):
+                        reshape = Reshape((input_shape[-3], self.nb_filters))
+                        self._build_layer(reshape)
+                else:
+                    name = 'conv1D_{}'.format(k)
+                    # name scope used to make sure weights get unique names
+                    with K.name_scope(name):
+                        conv = Conv1D(
+                            filters=self.nb_filters,
+                            kernel_size=self.kernel_size,
+                            dilation_rate=self.dilation_rate,
+                            padding=self.padding,
+                            name=name,
+                            kernel_initializer=self.kernel_initializer
+                        )
+                        if self.use_weight_norm:
+                            from tensorflow_addons.layers import WeightNormalization
+                            # wrap it. WeightNormalization API is different than BatchNormalization or LayerNormalization.
+                            with K.name_scope('norm_{}'.format(k)):
+                                conv = WeightNormalization(conv)
+                        self._build_layer(conv)
 
                 with K.name_scope('norm_{}'.format(k)):
                     if self.use_batch_norm:
@@ -113,23 +144,50 @@ class ResidualBlock(Layer):
                 self._build_layer(Activation(self.activation))
                 self._build_layer(SpatialDropout1D(rate=self.dropout_rate))
 
-            if self.nb_filters != input_shape[-1]:
-                # 1x1 conv to match the shapes (channel dimension).
-                name = 'matching_conv1D'
+            if len(input_shape) != 4:
+                if self.nb_filters != input_shape[-1]:
+                    # 1x1 conv to match the shapes (channel dimension).
+                    name = 'matching_conv1D'
+                    with K.name_scope(name):
+                        # make and build this layer separately because it directly uses input_shape
+                        self.shape_match_conv = Conv1D(filters=self.nb_filters,
+                                                       kernel_size=1,
+                                                       padding='same',
+                                                       name=name,
+                                                       kernel_initializer=self.kernel_initializer)
+                else:
+                    name = 'matching_identity'
+                    with K.name_scope(name):
+                        self.shape_match_conv = Lambda(lambda x: x, name=name)
+                with K.name_scope(name):
+                    self.shape_match_conv.build(input_shape)
+                    self.res_output_shape = self.shape_match_conv.compute_output_shape(
+                        input_shape)
+                name = 'matching_reshape'
+                with K.name_scope(name):
+                    self.shape_match_reshape = Lambda(lambda x: x, name=name)
+                    self.shape_match_reshape.build(self.res_output_shape)
+            else:
+                # 1xN conv to match the shapes (channel dimension).
+                name = 'matching_conv2D'
                 with K.name_scope(name):
                     # make and build this layer separately because it directly uses input_shape
-                    self.shape_match_conv = Conv1D(filters=self.nb_filters,
-                                                   kernel_size=1,
-                                                   padding='same',
+                    self.shape_match_conv = Conv2D(filters=self.nb_filters,
+                                                   kernel_size=(
+                                                       1, input_shape[-2]),
+                                                   padding='valid',
                                                    name=name,
                                                    kernel_initializer=self.kernel_initializer)
-            else:
-                name = 'matching_identity'
-                self.shape_match_conv = Lambda(lambda x: x, name=name)
-
-            with K.name_scope(name):
-                self.shape_match_conv.build(input_shape)
-                self.res_output_shape = self.shape_match_conv.compute_output_shape(input_shape)
+                    self.shape_match_conv.build(input_shape)
+                    self.res_output_shape = self.shape_match_conv.compute_output_shape(
+                        input_shape)
+                name = 'matching_reshape'
+                with K.name_scope(name):
+                    self.shape_match_reshape = Reshape(
+                        (input_shape[-3], self.nb_filters), name=name)
+                    self.shape_match_reshape.build(self.res_output_shape)
+                    self.res_output_shape = self.shape_match_reshape.compute_output_shape(
+                        self.res_output_shape)
 
             self._build_layer(Activation(self.activation))
             self.final_activation = Activation(self.activation)
@@ -156,11 +214,15 @@ class ResidualBlock(Layer):
             self.layers_outputs.append(x)
         x2 = self.shape_match_conv(inputs)
         self.layers_outputs.append(x2)
-        res_x = layers.add([x2, x])
+        x3 = self.shape_match_reshape(x2)
+        self.layers_outputs.append(x3)
+        res_x = layers.add([x3, x])
         self.layers_outputs.append(res_x)
 
         res_act_x = self.final_activation(res_x)
         self.layers_outputs.append(res_act_x)
+        res_act_x.set_shape(self.res_output_shape)
+        x.set_shape(self.res_output_shape)
         return [res_act_x, x]
 
     def compute_output_shape(self, input_shape):
@@ -224,7 +286,7 @@ class TCN(Layer):
         self.use_layer_norm = use_layer_norm
         self.use_weight_norm = use_weight_norm
         self.skip_connections = []
-        self.residual_blocks = []
+        self.layers = []
         self.layers_outputs = []
         self.build_output_shape = None
         self.slicer_layer = None  # in case return_sequence=False
@@ -253,7 +315,7 @@ class TCN(Layer):
         self.build_output_shape = input_shape
 
         # list to hold all the member ResidualBlocks
-        self.residual_blocks = []
+        self.layers = []
         total_num_blocks = self.nb_stacks * len(self.dilations)
         if not self.use_skip_connections:
             total_num_blocks += 1  # cheap way to do a false case for below
@@ -261,24 +323,24 @@ class TCN(Layer):
         for s in range(self.nb_stacks):
             for i, d in enumerate(self.dilations):
                 res_block_filters = self.nb_filters[i] if isinstance(self.nb_filters, list) else self.nb_filters
-                self.residual_blocks.append(ResidualBlock(dilation_rate=d,
-                                                          nb_filters=res_block_filters,
-                                                          kernel_size=self.kernel_size,
-                                                          padding=self.padding,
-                                                          activation=self.activation,
-                                                          dropout_rate=self.dropout_rate,
-                                                          use_batch_norm=self.use_batch_norm,
-                                                          use_layer_norm=self.use_layer_norm,
-                                                          use_weight_norm=self.use_weight_norm,
-                                                          kernel_initializer=self.kernel_initializer,
-                                                          name='residual_block_{}'.format(len(self.residual_blocks))))
+                self.layers.append(ResidualBlock(dilation_rate=d,
+                                                 nb_filters=res_block_filters,
+                                                 kernel_size=self.kernel_size,
+                                                 padding=self.padding,
+                                                 activation=self.activation,
+                                                 dropout_rate=self.dropout_rate,
+                                                 use_batch_norm=self.use_batch_norm,
+                                                 use_layer_norm=self.use_layer_norm,
+                                                 use_weight_norm=self.use_weight_norm,
+                                                 kernel_initializer=self.kernel_initializer,
+                                                 name='residual_block_{}'.format(len(self.layers))))
                 # build newest residual block
-                self.residual_blocks[-1].build(self.build_output_shape)
-                self.build_output_shape = self.residual_blocks[-1].res_output_shape
+                self.layers[-1].build(self.build_output_shape)
+                self.build_output_shape = self.layers[-1].res_output_shape
 
-        # this is done to force keras to add the layers in the list to self._layers
-        for layer in self.residual_blocks:
-            self.__setattr__(layer.name, layer)
+        # # this is done to force keras to add the layers in the list to self._layers
+        # for layer in self.layers:
+        #     self.__setattr__(layer.name, layer)
 
         self.output_slice_index = None
         if self.padding == 'same':
@@ -312,11 +374,11 @@ class TCN(Layer):
         x = inputs
         self.layers_outputs = [x]
         self.skip_connections = []
-        for layer in self.residual_blocks:
-            try:
-                x, skip_out = layer(x, training=training)
-            except TypeError:  # compatibility with tensorflow 1.x
-                x, skip_out = layer(K.cast(x, 'float32'), training=training)
+        for layer in self.layers:
+            # try:
+            x, skip_out = layer(x, training=training)
+            # except TypeError:  # compatibility with tensorflow 1.x
+            # x, skip_out = layer(K.cast(x, 'float32'), training=training)
             self.skip_connections.append(skip_out)
             self.layers_outputs.append(x)
 
@@ -330,6 +392,7 @@ class TCN(Layer):
                 self.output_slice_index = K.shape(self.layers_outputs[-1])[1] // 2
             x = self.slicer_layer(x)
             self.layers_outputs.append(x)
+        x.set_shape(self.compute_output_shape(inputs))
         return x
 
     def get_config(self):
@@ -456,27 +519,226 @@ def compiled_tcn(num_feat,  # type: int
 
 
 def tcn_full_summary(model: Model, expand_residual_blocks=True):
-    layers = model._layers.copy()  # store existing layers
-    model._layers.clear()  # clear layers
-
-    for i in range(len(layers)):
-        if isinstance(layers[i], TCN):
-            for layer in layers[i]._layers:
-                if not isinstance(layer, ResidualBlock):
-                    if not hasattr(layer, '__iter__'):
-                        model._layers.append(layer)
-                else:
+    def append_table(table, layer, output_shape):
+        table.append(
+            (
+                layer.name + "(" + layer.__class__.__name__ + ")",
+                f"{output_shape}",
+                f"{layer.count_params()}"
+            ))
+    table = [("Layer (type)", "Output Shape", "Param #")]
+    for layer in model.layers:
+        if isinstance(layer, TCN):
+            for residual_block in layer.layers:
+                if isinstance(residual_block, ResidualBlock):
                     if expand_residual_blocks:
-                        for lyr in layer._layers:
-                            if not hasattr(lyr, '__iter__'):
-                                model._layers.append(lyr)
+                        for sublayer in residual_block.layers:
+                            try:
+                                output_shape = sublayer.output_shape
+                            except AttributeError:
+                                output_shape = 'multiple'
+                            except RuntimeError:  # output_shape unknown in Eager mode.
+                                output_shape = '?'
+                            append_table(table, sublayer, output_shape)
                     else:
-                        model._layers.append(layer)
+                        append_table(table, residual_block,
+                                     residual_block.res_output_shape)
+                else:
+                    raise "Non ResidualBlock layer in TCN"
         else:
-            model._layers.append(layers[i])
+            append_table(table, layer, layer.output_shape)
+    print(f"Model: \"{model.name}\"")
+    lengths = [max(map(len, map(str, x))) for x in zip(*table)]
+    lengths = [max(x) for x in zip(lengths, [28, 25, 10])]
+    fmt = ' '.join('{:<%d}' % l for l in lengths)
+    line_len = sum(lengths) + len(lengths) - 1
+    print('_' * line_len)
+    print(fmt.format(*table[0]))  # header
+    print('=' * line_len)
+    for i in range(1, len(table)):
+        row = table[i]
+        if i != 1:
+            print('_' * line_len)
+        print(fmt.format(*row))
+    print('=' * line_len)
+    print(f"Total params: {model.count_params()}")
+    print(
+        f"Trainable params: {count_params(model.trainable_weights)}")
+    print(
+        f"Non-trainable params: {count_params(model.non_trainable_variables)}")
 
-    model.summary()  # print summary
 
-    # restore original layers
-    model._layers.clear()
-    [model._layers.append(lyr) for lyr in layers]
+def print_summary(model, line_length=None, positions=None, print_fn=None, expand_depth=0):
+    """Prints a summary of a model.
+    Args:
+        model: Keras model instance.
+        line_length: Total length of printed lines
+            (e.g. set this to adapt the display to different
+            terminal window sizes).
+        positions: Relative or absolute positions of log elements in each line.
+            If not provided, defaults to `[.33, .55, .67, 1.]`.
+        print_fn: Print function to use.
+            It will be called on each line of the summary.
+            You can set it to a custom function
+            in order to capture the string summary.
+            It defaults to `print` (prints to stdout).
+    """
+    if print_fn is None:
+        print_fn = print
+
+    if model.__class__.__name__ == 'Sequential':
+        sequential_like = True
+    elif not model._is_graph_network:
+        # We treat subclassed models as a simple sequence of layers, for logging
+        # purposes.
+        sequential_like = True
+    else:
+        sequential_like = True
+        nodes_by_depth = model._nodes_by_depth.values()
+        nodes = []
+        for v in nodes_by_depth:
+            if (len(v) > 1) or (len(v) == 1 and
+                                len(nest.flatten(v[0].keras_inputs)) > 1):
+                # if the model has multiple nodes
+                # or if the nodes have multiple inbound_layers
+                # the model is no longer sequential
+                sequential_like = False
+                break
+            nodes += v
+        if sequential_like:
+            # search for shared layers
+            for layer in model.layers:
+                flag = False
+                for node in layer._inbound_nodes:
+                    if node in nodes:
+                        if flag:
+                            sequential_like = False
+                            break
+                        else:
+                            flag = True
+                if not sequential_like:
+                    break
+
+    if sequential_like:
+        line_length = line_length or 65
+        positions = positions or [.45, .85, 1.]
+        if positions[-1] <= 1:
+            positions = [int(line_length * p) for p in positions]
+        # header names for the different log elements
+        to_display = ['Layer (type)', 'Output Shape', 'Param #']
+    else:
+        line_length = line_length or 98
+        positions = positions or [.33, .55, .67, 1.]
+        if positions[-1] <= 1:
+            positions = [int(line_length * p) for p in positions]
+        # header names for the different log elements
+        to_display = ['Layer (type)', 'Output Shape',
+                      'Param #', 'Connected to']
+        relevant_nodes = []
+        for v in model._nodes_by_depth.values():
+            relevant_nodes += v
+
+    def print_row(fields, positions):
+        line = ''
+        for i in range(len(fields)):
+            if i > 0:
+                line = line[:-1] + ' '
+            line += str(fields[i])
+            line = line[:positions[i]]
+            line += ' ' * (positions[i] - len(line))
+        print_fn(line)
+
+    print_fn('Model: "{}"'.format(model.name))
+    print_fn('_' * line_length)
+    print_row(to_display, positions)
+    print_fn('=' * line_length)
+
+    def print_layer_summary(layer):
+        """Prints a summary for a single layer.
+        Args:
+            layer: target layer.
+        """
+        try:
+            output_shape = layer.output_shape
+        except AttributeError:
+            output_shape = 'multiple'
+        except RuntimeError:  # output_shape unknown in Eager mode.
+            output_shape = '?'
+        name = layer.name
+        cls_name = layer.__class__.__name__
+        if not layer.built and not getattr(layer, '_is_graph_network', False):
+            # If a subclassed model has a layer that is not called in Model.call, the
+            # layer will not be built and we cannot call layer.count_params().
+            print(f"Subclassed layer: {layer.name}")
+            params = '0 (unused)'
+        else:
+            params = layer.count_params()
+        fields = [name + ' (' + cls_name + ')', output_shape, params]
+        print_row(fields, positions)
+
+    def print_layer_summary_with_connections(layer):
+        """Prints a summary for a single layer (including topological connections).
+        Args:
+            layer: target layer.
+        """
+        try:
+            output_shape = layer.output_shape
+        except AttributeError:
+            output_shape = 'multiple'
+        connections = []
+        for node in layer._inbound_nodes:
+            if relevant_nodes and node not in relevant_nodes:
+                # node is not part of the current network
+                continue
+
+            for inbound_layer, node_index, tensor_index, _ in node.iterate_inbound():
+                connections.append('{}[{}][{}]'.format(inbound_layer.name, node_index,
+                                                       tensor_index))
+
+        name = layer.name
+        cls_name = layer.__class__.__name__
+        if not connections:
+            first_connection = ''
+        else:
+            first_connection = connections[0]
+        fields = [
+            name + ' (' + cls_name + ')', output_shape,
+            layer.count_params(), first_connection
+        ]
+        print_row(fields, positions)
+        if len(connections) > 1:
+            for i in range(1, len(connections)):
+                fields = ['', '', '', connections[i]]
+                print_row(fields, positions)
+
+    def print_expanded_summary(layer, expand, is_last):
+        if expand > 0 and hasattr(layer, "layers"):
+            for i in range(len(layer.layers)):
+                print_expanded_summary(
+                    layer.layers[i], expand-1, is_last and i == len(layers)-1)
+        else:
+            if sequential_like:
+                print_layer_summary(layer)
+            else:
+                print_layer_summary_with_connections(layer)
+            if is_last:
+                print_fn('=' * line_length)
+            else:
+                print_fn('_' * line_length)
+
+    layers = model.layers
+    for i in range(len(layers)):
+        print_expanded_summary(layers[i], expand_depth, i == len(layers)-1)
+
+    if hasattr(model, '_collected_trainable_weights'):
+        trainable_count = count_params(model._collected_trainable_weights)
+    else:
+        trainable_count = count_params(model.trainable_weights)
+
+    non_trainable_count = count_params(model.non_trainable_weights)
+
+    print_fn('Total params: {:,}'.format(
+        trainable_count + non_trainable_count))
+    print_fn('Trainable params: {:,}'.format(trainable_count))
+    print_fn('Non-trainable params: {:,}'.format(non_trainable_count))
+    print_fn('_' * line_length)

@@ -1,3 +1,3 @@
-from tcn.tcn import TCN, compiled_tcn, tcn_full_summary  # noqa
+from tcn.tcn import TCN, compiled_tcn, tcn_full_summary, print_summary  # noqa
 
-__version__ = '3.4.0'
+__version__ = '4.0.0'
