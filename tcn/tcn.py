@@ -5,7 +5,9 @@ from tensorflow.keras import backend as K, Model, Input, optimizers
 from tensorflow.keras import layers
 from tensorflow.keras.layers import Activation, SpatialDropout1D, Lambda
 from tensorflow.keras.layers import Layer, Conv1D, Dense, BatchNormalization, LayerNormalization
-from tensorflow.keras.layers import Conv2D, ZeroPadding2D, Reshape
+from tensorflow.keras.layers import Conv2D, ZeroPadding2D, SpatialDropout2D
+from tensorflow import nest
+from tensorflow_addons.layers import WeightNormalization
 from keras.utils.layer_utils import count_params
 
 
@@ -39,7 +41,7 @@ class ResidualBlock(Layer):
         Args:
             x: The previous layer in the model
             training: boolean indicating whether the layer should behave in training mode or in inference mode
-            dilation_rate: The dilation power of 2 we are using for this residual block
+            dilation_rate: The dilation power of 2 we are using for this residual block; defines dilation in temporal dimension only, spatial is for now 1
             nb_filters: The number of convolutional filters to use in this block
             kernel_size: The size of the convolutional kernel
             padding: The padding used in the convolutional layers, 'same' or 'causal'.
@@ -65,7 +67,6 @@ class ResidualBlock(Layer):
         self.layers = []
         self.layers_outputs = []
         self.shape_match_conv = None
-        self.shape_match_reshape = None
         self.res_output_shape = None
         self.final_activation = None
 
@@ -75,7 +76,7 @@ class ResidualBlock(Layer):
         """Helper function for building layer
         Args:
             layer: Appends layer to internal layer list and builds it based on the current output
-                   shape of ResidualBlocK. Updates current output shape.
+                   shape of ResidualBlock. Updates current output shape.
         """
         self.layers.append(layer)
         self.layers[-1].build(self.res_output_shape)
@@ -86,37 +87,14 @@ class ResidualBlock(Layer):
         with K.name_scope(self.name):  # name scope used to make sure weights get unique names
             self.layers = []
             self.res_output_shape = input_shape
+            spatial_kernel_sizes = 0
 
             for k in range(2):
-                if k == 0 and len(input_shape) == 4:
-                    # make a Conv2D layer by ZeroPadding2D -> Conv2D -> Reshape
-                    with K.name_scope('zeropadding2D_{}'.format(k)):
-                        zeropad = ZeroPadding2D(
-                            padding=((self.kernel_size-1, 0), (0, 0)))
-                        self._build_layer(zeropad)
-                    name = 'conv2D_{}'.format(k)
-                    # name scope used to make sure weights get unique names
-                    with K.name_scope(name):
-                        conv = Conv2D(
-                            filters=self.nb_filters,
-                            kernel_size=self.kernel_size,
-                            dilation_rate=self.dilation_rate,
-                            padding='valid',
-                            name=name,
-                            kernel_initializer=self.kernel_initializer
-                        )
-                        if self.use_weight_norm:
-                            from tensorflow_addons.layers import WeightNormalization
-                            # wrap it. WeightNormalization API is different than BatchNormalization or LayerNormalization.
-                            with K.name_scope('norm_{}'.format(k)):
-                                conv = WeightNormalization(conv)
-                        self._build_layer(conv)
-                    with K.name_scope('reshape_{}'.format(k)):
-                        reshape = Reshape((input_shape[-3], self.nb_filters))
-                        self._build_layer(reshape)
-                else:
+                if len(self.res_output_shape) != 4:
+                    # make a Conv1D layer
                     name = 'conv1D_{}'.format(k)
                     # name scope used to make sure weights get unique names
+                    spatial_kernel_sizes += 1
                     with K.name_scope(name):
                         conv = Conv1D(
                             filters=self.nb_filters,
@@ -127,7 +105,35 @@ class ResidualBlock(Layer):
                             kernel_initializer=self.kernel_initializer
                         )
                         if self.use_weight_norm:
-                            from tensorflow_addons.layers import WeightNormalization
+                            # wrap it. WeightNormalization API is different than BatchNormalization or LayerNormalization.
+                            with K.name_scope('norm_{}'.format(k)):
+                                conv = WeightNormalization(conv)
+                        self._build_layer(conv)
+                else:
+                    # make a Conv2D layer by
+                    # > ZeroPadding2D (to the start; only if padding 'causal')
+                    # > Conv2D
+                    this_input_shape = self.res_output_shape
+                    kernel_size = self.res_output_shape[-2] if self.res_output_shape[-2] < self.kernel_size else self.kernel_size
+                    spatial_kernel_sizes += kernel_size
+                    if self.padding == 'causal':
+                        with K.name_scope('zeropadding2D_{}'.format(k)):
+                            zeropad = ZeroPadding2D(
+                                padding=(((kernel_size-1)*self.dilation_rate, 0), (0, 0)))
+                            self._build_layer(zeropad)
+                    name = 'conv2D_{}'.format(k)
+                    # name scope used to make sure weights get unique names
+                    with K.name_scope(name):
+                        conv = Conv2D(
+                            filters=self.nb_filters,
+                            kernel_size=kernel_size,
+                            # dilation rate in spatial dim is always 1, dilation_rate defines time dim rate
+                            dilation_rate=(self.dilation_rate, 1),
+                            padding='valid',
+                            name=name,
+                            kernel_initializer=self.kernel_initializer
+                        )
+                        if self.use_weight_norm:
                             # wrap it. WeightNormalization API is different than BatchNormalization or LayerNormalization.
                             with K.name_scope('norm_{}'.format(k)):
                                 conv = WeightNormalization(conv)
@@ -142,7 +148,10 @@ class ResidualBlock(Layer):
                         pass  # done above.
 
                 self._build_layer(Activation(self.activation))
-                self._build_layer(SpatialDropout1D(rate=self.dropout_rate))
+                if len(self.res_output_shape) == 4:
+                    self._build_layer(SpatialDropout2D(rate=self.dropout_rate))
+                else:
+                    self._build_layer(SpatialDropout1D(rate=self.dropout_rate))
 
             if len(input_shape) != 4:
                 if self.nb_filters != input_shape[-1]:
@@ -155,49 +164,26 @@ class ResidualBlock(Layer):
                                                        padding='same',
                                                        name=name,
                                                        kernel_initializer=self.kernel_initializer)
+                        self.shape_match_conv.build(input_shape)
+                        self.res_output_shape = self.shape_match_conv.compute_output_shape(input_shape)
                 else:
-                    name = 'matching_identity'
-                    with K.name_scope(name):
-                        self.shape_match_conv = Lambda(lambda x: x, name=name)
-                with K.name_scope(name):
-                    self.shape_match_conv.build(input_shape)
-                    self.res_output_shape = self.shape_match_conv.compute_output_shape(
-                        input_shape)
-                name = 'matching_reshape'
-                with K.name_scope(name):
-                    self.shape_match_reshape = Lambda(lambda x: x, name=name)
-                    self.shape_match_reshape.build(self.res_output_shape)
+                    self.shape_match_conv = None
             else:
-                # 1xN conv to match the shapes (channel dimension).
+                # 2D 1x1 conv to match the shapes (channel dimension).
                 name = 'matching_conv2D'
                 with K.name_scope(name):
                     # make and build this layer separately because it directly uses input_shape
                     self.shape_match_conv = Conv2D(filters=self.nb_filters,
-                                                   kernel_size=(
-                                                       1, input_shape[-2]),
+                                                   kernel_size=(1, spatial_kernel_sizes-1),  # (1, input_shape[-2]),
                                                    padding='valid',
                                                    name=name,
                                                    kernel_initializer=self.kernel_initializer)
                     self.shape_match_conv.build(input_shape)
-                    self.res_output_shape = self.shape_match_conv.compute_output_shape(
-                        input_shape)
-                name = 'matching_reshape'
-                with K.name_scope(name):
-                    self.shape_match_reshape = Reshape(
-                        (input_shape[-3], self.nb_filters), name=name)
-                    self.shape_match_reshape.build(self.res_output_shape)
-                    self.res_output_shape = self.shape_match_reshape.compute_output_shape(
-                        self.res_output_shape)
+                    self.res_output_shape = self.shape_match_conv.compute_output_shape(input_shape)
 
             self._build_layer(Activation(self.activation))
             self.final_activation = Activation(self.activation)
             self.final_activation.build(self.res_output_shape)  # probably isn't necessary
-
-            # this is done to force Keras to add the layers in the list to self._layers
-            for layer in self.layers:
-                self.__setattr__(layer.name, layer)
-            self.__setattr__(self.shape_match_conv.name, self.shape_match_conv)
-            self.__setattr__(self.final_activation.name, self.final_activation)
 
             super(ResidualBlock, self).build(input_shape)  # done to make sure self.built is set True
 
@@ -212,18 +198,19 @@ class ResidualBlock(Layer):
             training_flag = 'training' in dict(inspect.signature(layer.call).parameters)
             x = layer(x, training=training) if training_flag else layer(x)
             self.layers_outputs.append(x)
-        x2 = self.shape_match_conv(inputs)
-        self.layers_outputs.append(x2)
-        x3 = self.shape_match_reshape(x2)
-        self.layers_outputs.append(x3)
-        res_x = layers.add([x3, x])
+        x_skip = x
+        x = inputs
+        if self.shape_match_conv:
+            x = self.shape_match_conv(x)
+            self.layers_outputs.append(x)
+        res_x = layers.add([x, x_skip])
         self.layers_outputs.append(res_x)
 
         res_act_x = self.final_activation(res_x)
         self.layers_outputs.append(res_act_x)
         res_act_x.set_shape(self.res_output_shape)
-        x.set_shape(self.res_output_shape)
-        return [res_act_x, x]
+        x_skip.set_shape(self.res_output_shape)
+        return [res_act_x, x_skip, self.shape_match_conv]
 
     def compute_output_shape(self, input_shape):
         return [self.res_output_shape, self.res_output_shape]
@@ -316,9 +303,6 @@ class TCN(Layer):
 
         # list to hold all the member ResidualBlocks
         self.layers = []
-        total_num_blocks = self.nb_stacks * len(self.dilations)
-        if not self.use_skip_connections:
-            total_num_blocks += 1  # cheap way to do a false case for below
 
         for s in range(self.nb_stacks):
             for i, d in enumerate(self.dilations):
@@ -338,10 +322,6 @@ class TCN(Layer):
                 self.layers[-1].build(self.build_output_shape)
                 self.build_output_shape = self.layers[-1].res_output_shape
 
-        # # this is done to force keras to add the layers in the list to self._layers
-        # for layer in self.layers:
-        #     self.__setattr__(layer.name, layer)
-
         self.output_slice_index = None
         if self.padding == 'same':
             time = self.build_output_shape.as_list()[1]
@@ -350,10 +330,26 @@ class TCN(Layer):
             else:
                 # It will known at call time. c.f. self.call.
                 self.padding_same_and_time_dim_unknown = True
-
         else:
             self.output_slice_index = -1  # causal case.
-        self.slicer_layer = Lambda(lambda tt: tt[:, self.output_slice_index, :])
+
+        self.computed_output_shape = self.build_output_shape
+        if len(self.build_output_shape) != 4:
+            if not self.return_sequences:
+                self.slicer_layer = Lambda(lambda tt: tt[:, self.output_slice_index, :])
+                self.computed_output_shape = self.build_output_shape[:1]+self.build_output_shape[2:]
+        else:
+            if self.build_output_shape.as_list()[-2] == 1:
+                # (also) remove to-1-reduced spatial dimension with slicer
+                if not self.return_sequences:
+                    self.slicer_layer = Lambda(lambda tt: tt[:, self.output_slice_index, 0, :])
+                    self.computed_output_shape = self.build_output_shape[:1]+self.build_output_shape[3:]
+                else:
+                    self.slicer_layer = Lambda(lambda tt: tt[:, :, 0, :])
+                    self.computed_output_shape = self.build_output_shape[:2]+self.build_output_shape[3:]
+            elif not self.return_sequences:
+                self.slicer_layer = Lambda(lambda tt: tt[:, self.output_slice_index, :, :])
+                self.computed_output_shape = self.build_output_shape[:1]+self.build_output_shape[2:]
 
     def compute_output_shape(self, input_shape):
         """
@@ -361,32 +357,31 @@ class TCN(Layer):
         """
         if not self.built:
             self.build(input_shape)
-        if not self.return_sequences:
-            batch_size = self.build_output_shape[0]
-            batch_size = batch_size.value if hasattr(batch_size, 'value') else batch_size
-            nb_filters = self.build_output_shape[-1]
-            return [batch_size, nb_filters]
-        else:
-            # Compatibility tensorflow 1.x
-            return [v.value if hasattr(v, 'value') else v for v in self.build_output_shape]
+        return self.computed_output_shape
 
     def call(self, inputs, training=None):
         x = inputs
         self.layers_outputs = [x]
         self.skip_connections = []
+        match_convs = []
         for layer in self.layers:
-            # try:
-            x, skip_out = layer(x, training=training)
-            # except TypeError:  # compatibility with tensorflow 1.x
-            # x, skip_out = layer(K.cast(x, 'float32'), training=training)
+            x, skip_out, match_conv = layer(x, training=training)
             self.skip_connections.append(skip_out)
             self.layers_outputs.append(x)
+            match_convs.append(match_conv)
 
         if self.use_skip_connections:
-            x = layers.add(self.skip_connections)
+            if not any(match_convs):
+                x = layers.add(self.skip_connections)
+            else:
+                x = self.skip_connections[0]
+                for i, skip in enumerate(self.skip_connections[1:]):
+                    if match_convs[i+1]:
+                        x = match_convs[i+1](x)
+                    x = layers.add([x, skip])
             self.layers_outputs.append(x)
 
-        if not self.return_sequences:
+        if self.slicer_layer:
             # case: time dimension is unknown. e.g. (bs, None, input_dim).
             if self.padding_same_and_time_dim_unknown:
                 self.output_slice_index = K.shape(self.layers_outputs[-1])[1] // 2
@@ -476,8 +471,6 @@ def compiled_tcn(num_feat,  # type: int
             activation, kernel_initializer, use_batch_norm, use_layer_norm,
             use_weight_norm, name=name)(input_layer)
 
-    print('x.shape=', x.shape)
-
     def get_opt():
         if opt == 'adam':
             return optimizers.Adam(lr=lr, clipnorm=1.)
@@ -513,8 +506,7 @@ def compiled_tcn(num_feat,  # type: int
         output_layer = x
         model = Model(input_layer, output_layer)
         model.compile(get_opt(), loss='mean_squared_error')
-    print('model.x = {}'.format(input_layer.shape))
-    print('model.y = {}'.format(output_layer.shape))
+
     return model
 
 
